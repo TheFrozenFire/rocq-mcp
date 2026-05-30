@@ -13,3 +13,5 @@ build/
 *.timing
 .pytest_cache/
 .venv/
+rebase.log
+cp.log

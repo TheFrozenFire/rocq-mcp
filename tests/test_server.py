@@ -853,6 +853,85 @@ class TestParseDuneFlags:
             flags = _parse_dune_flags(tmp_path)
         assert flags == ["-Q", "_build/default/thB", "thB"]
 
+    def test_rocq_theory_stanza_matched(self, tmp_path):
+        """A modern ``(rocq.theory ...)`` stanza is recognised as a theory dir."""
+        from rocq_mcp.server import _find_coq_theory_dirs
+
+        (tmp_path / "dune-project").write_text("(lang dune 3.21)\n(using rocq 0.11)\n")
+        (tmp_path / "theory").mkdir()
+        (tmp_path / "theory" / "dune").write_text("(rocq.theory (name mwe))\n")
+        (tmp_path / "theory" / "x.v").write_text("")
+        assert _find_coq_theory_dirs(tmp_path) == [tmp_path / "theory"]
+
+    def test_dune_coq_top_preferred_when_it_succeeds(self, tmp_path):
+        """Legacy ``dune coq top`` succeeding is used without trying ``rocq top``."""
+        (tmp_path / "dune-project").write_text("(lang dune 3.8)\n")
+        (tmp_path / "test.v").write_text("")
+
+        subcmds: list[str] = []
+
+        def fake_run(cmd, *_a, **_kw):
+            subcmds.append(cmd[1])  # "coq" or "rocq"
+            return mock.Mock(returncode=0, stdout="-R _build/default/lib lib")
+
+        with mock.patch("rocq_mcp.server.subprocess.run", side_effect=fake_run):
+            flags = _parse_dune_flags(tmp_path)
+        assert flags == ["-R", "_build/default/lib", "lib"]
+        # coq top succeeded first -> rocq top never attempted.
+        assert subcmds == ["coq"]
+
+    def test_dune_rocq_top_fallback_when_coq_top_fails(self, tmp_path):
+        """A ``(rocq.theory ...)`` project (``dune coq top`` fails) uses ``rocq top``.
+
+        Regression test for issue #34: modern ``(using rocq ...)`` dune
+        projects were undetected, so pet fell back to a single-theory load
+        path and cross-theory ``Require``s silently failed.
+        """
+        (tmp_path / "dune-project").write_text("(lang dune 3.21)\n(using rocq 0.11)\n")
+        (tmp_path / "theory").mkdir()
+        (tmp_path / "theory" / "dune").write_text("(rocq.theory (name mwe))\n")
+        (tmp_path / "theory" / "use.v").write_text("")
+
+        subcmds: list[str] = []
+
+        def fake_run(cmd, *_a, **_kw):
+            subcmds.append(cmd[1])
+            if cmd[1] == "coq":
+                # rocq-stanza project: `dune coq top` cannot resolve it.
+                return mock.Mock(returncode=1, stdout="")
+            return mock.Mock(returncode=0, stdout="-R _build/default/theory mwe")
+
+        with mock.patch("rocq_mcp.server.subprocess.run", side_effect=fake_run):
+            flags = _parse_dune_flags(tmp_path)
+        assert flags == ["-R", "_build/default/theory", "mwe"]
+        # Tried coq first, then fell back to rocq.
+        assert subcmds == ["coq", "rocq"]
+        proj = (tmp_path / "_RocqProject").read_text()
+        assert "-R _build/default/theory mwe" in proj
+
+    def test_both_dune_subcommands_fail_returns_none(self, tmp_path):
+        """When neither ``dune coq top`` nor ``dune rocq top`` resolves, return None.
+
+        Pins the loop's terminal branch: both subcommands are attempted (in
+        order) and the fallthrough yields None so ``_parse_project_flags``
+        drops to the synthetic ``-Q <ws> Test`` last resort.
+        """
+        (tmp_path / "dune-project").write_text("(lang dune 3.21)\n")
+        (tmp_path / "test.v").write_text("")
+
+        subcmds: list[str] = []
+
+        def fake_run(cmd, *_a, **_kw):
+            subcmds.append(cmd[1])
+            return mock.Mock(returncode=1, stdout="")
+
+        with mock.patch("rocq_mcp.server.subprocess.run", side_effect=fake_run):
+            flags = _parse_dune_flags(tmp_path)
+        assert flags is None
+        assert subcmds == ["coq", "rocq"]
+        # No _RocqProject materialized on total detection failure.
+        assert not (tmp_path / "_RocqProject").is_file()
+
 
 # =========================================================================
 # _find_project_root_from_file — workspace auto-detection

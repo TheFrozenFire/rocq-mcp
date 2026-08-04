@@ -126,6 +126,102 @@ class TestCheckStaleness:
         assert _check_staleness(entry) is None
 
 
+class TestVoEpochStaleness:
+    """Dependency-.vo rebuild detection via the per-workspace .vo epoch (#29)."""
+
+    def _entry(self, tmp_path, vo_epoch):
+        # No backing .v (resolved_file=None) so only the epoch check applies.
+        return _StateEntry(
+            state=None,
+            file="X.v",
+            theorem="foo",
+            workspace=str(tmp_path),
+            parent_id=None,
+            tactic=None,
+            step=0,
+            file_mtime=None,
+            resolved_file=None,
+            vo_epoch=vo_epoch,
+        )
+
+    def test_warns_when_epoch_advanced(self, tmp_path):
+        ls = make_lifespan_state()
+        ls["vo_epochs"] = {str(tmp_path.resolve()): 1}
+        entry = self._entry(tmp_path, vo_epoch=0)
+        warning = _check_staleness(entry, ls)
+        assert warning is not None
+        assert "dependency .vo" in warning
+        assert "rebuilt" in warning
+
+    def test_no_warning_when_epoch_matches(self, tmp_path):
+        ls = make_lifespan_state()
+        ls["vo_epochs"] = {str(tmp_path.resolve()): 1}
+        entry = self._entry(tmp_path, vo_epoch=1)
+        assert _check_staleness(entry, ls) is None
+
+    def test_no_warning_without_lifespan_state(self, tmp_path):
+        # Backward-compatible one-arg call skips the epoch check entirely.
+        entry = self._entry(tmp_path, vo_epoch=0)
+        assert _check_staleness(entry) is None
+
+    def test_epoch_helpers_bump_only_on_rebuild(self, tmp_path):
+        import rocq_mcp.server as _server
+
+        ls = make_lifespan_state()
+        ws = str(tmp_path)
+        key = str(tmp_path.resolve())
+        assert _server._current_vo_epoch(ls, ws) == 0
+        # No change in the snapshot -> no bump.
+        _server._bump_vo_epoch_if_rebuilt(ls, ws, {"a.vo": 1.0}, {"a.vo": 1.0})
+        assert _server._current_vo_epoch(ls, ws) == 0
+        # A rewritten .vo -> bump.
+        _server._bump_vo_epoch_if_rebuilt(ls, ws, {"a.vo": 1.0}, {"a.vo": 2.0})
+        assert _server._current_vo_epoch(ls, ws) == 1
+        # None snapshot (unscanned) -> no bump.
+        _server._bump_vo_epoch_if_rebuilt(ls, ws, None, {"a.vo": 3.0})
+        assert _server._current_vo_epoch(ls, ws) == 1
+        assert ls["vo_epochs"] == {key: 1}
+
+    def test_child_state_inherits_parent_epoch(self, tmp_path):
+        """A child created after a rebuild inherits the parent's (older) epoch
+        so it is still flagged stale (no false-fresh)."""
+        import rocq_mcp.interactive as _it
+
+        ls = make_lifespan_state()
+        # Root stamped at epoch 0.
+        root_id = _it._state_add(
+            state=SimpleNamespace(proof_finished=False),
+            file="X.v",
+            theorem="foo",
+            workspace=str(tmp_path),
+            parent_id=None,
+            tactic=None,
+            step=0,
+            vo_epoch=0,
+        )
+        # A rebuild advances the workspace epoch to 1.
+        ls["vo_epochs"] = {str(tmp_path.resolve()): 1}
+        # Child created now; despite the current epoch being 1, it inherits
+        # the parent's 0 (passing the current epoch as a would-be fallback).
+        child_id = _it._state_add(
+            state=SimpleNamespace(proof_finished=True),
+            file="X.v",
+            theorem="foo",
+            workspace=str(tmp_path),
+            parent_id=root_id,
+            tactic="reflexivity.",
+            step=1,
+            vo_epoch=1,
+        )
+        try:
+            child = _it._state_table[child_id]
+            assert child.vo_epoch == 0
+            assert _check_staleness(child, ls) is not None  # flagged stale
+        finally:
+            _it._state_remove(root_id)
+            _it._state_remove(child_id)
+
+
 # ---------------------------------------------------------------------------
 # Integration: stale_warning in run_check results (mock-based, no pet)
 # ---------------------------------------------------------------------------

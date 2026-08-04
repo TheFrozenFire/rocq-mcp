@@ -406,6 +406,13 @@ async def run_compile_file_with_state(
     )
     if vo_warning and isinstance(result, dict):
         result["vo_rebuild_warning"] = vo_warning
+    # Advance the workspace's .vo epoch so live sessions holding a now-stale
+    # dependency learn their proof_finished may diverge from a clean compile
+    # (see server._current_vo_epoch / interactive._check_staleness).
+    if lifespan_state is not None:
+        _server._bump_vo_epoch_if_rebuilt(
+            lifespan_state, str(ws_path), vo_before, vo_after
+        )
 
     if lifespan_state is None:
         return result

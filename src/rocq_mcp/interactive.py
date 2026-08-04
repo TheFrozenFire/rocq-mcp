@@ -328,6 +328,12 @@ class _StateEntry:
     proof_finished: bool = False
     file_mtime: float | None = None  # mtime at session creation
     resolved_file: str | None = None  # absolute path for staleness check
+    # Workspace .vo epoch when this session's environment was established
+    # (inherited from the parent state so the whole lineage shares the root's
+    # value).  Compared against the current epoch to detect a dependency .vo
+    # rebuilt under a held session (see _check_staleness).  None for states
+    # created without a lifespan_state (e.g. some tests).
+    vo_epoch: int | None = None
     # Wall-clock timestamp; used by rocq_diag for age.
     created_at: float = field(default_factory=time.time)
 
@@ -352,11 +358,20 @@ def _state_add(
     *,
     file_mtime: float | None = None,
     resolved_file: str | None = None,
+    vo_epoch: int | None = None,
 ) -> int:
-    """Add a state to the table and return its integer ID."""
+    """Add a state to the table and return its integer ID.
+
+    *vo_epoch* stamps the workspace .vo epoch at session start.  A child
+    state (``parent_id`` present in the table) inherits its parent's epoch so
+    the whole lineage reflects when the root's environment was loaded — a
+    child created *after* a dependency rebuild must not look fresh.
+    """
     global _state_next_id
     sid = _state_next_id
     _state_next_id += 1
+    parent = _state_table.get(parent_id) if parent_id is not None else None
+    effective_epoch = parent.vo_epoch if parent is not None else vo_epoch
     _state_table[sid] = _StateEntry(
         state=state,
         file=file,
@@ -368,6 +383,7 @@ def _state_add(
         proof_finished=getattr(state, "proof_finished", False),
         file_mtime=file_mtime,
         resolved_file=resolved_file,
+        vo_epoch=effective_epoch,
     )
     # Evict LRU entries when table exceeds max size.
     while len(_state_table) > _MAX_STATES:
@@ -437,27 +453,50 @@ def _resolve_check_base_state(
     return entry, from_state, None
 
 
-def _check_staleness(entry: _StateEntry) -> str | None:
-    """Check if a state's backing file has been modified since session start.
+def _check_staleness(
+    entry: _StateEntry, lifespan_state: dict[str, Any] | None = None
+) -> str | None:
+    """Check whether a held state's environment may be stale.
 
-    Returns a warning message if the file changed or is inaccessible,
-    or None if fresh.  Returns None for preamble-mode states (no backing file).
+    Two independent signals, checked in order:
+
+    1. The state's own backing ``.v`` file changed on disk since session
+       start (or became inaccessible).
+    2. A *dependency* ``.vo`` in the workspace was rebuilt through this server
+       since the session's environment was established — a held ``state_id``
+       freezes the loaded libraries, so ``proof_finished`` on such a state
+       can diverge from a clean compile.  Detected via the per-workspace
+       ``.vo`` epoch; requires *lifespan_state*.
+
+    Returns a warning message on the first hit, or None if fresh.  Preamble
+    states (no backing file) skip check 1 but are still covered by check 2.
     """
-    if entry.resolved_file is None or entry.file_mtime is None:
-        return None
-    try:
-        current_mtime = os.path.getmtime(entry.resolved_file)
-    except OSError:
+    if entry.resolved_file is not None and entry.file_mtime is not None:
+        try:
+            current_mtime = os.path.getmtime(entry.resolved_file)
+        except OSError:
+            return (
+                f"File '{entry.file}' is no longer accessible. "
+                f"The proof state may be stale. "
+                f"Use rocq_start to begin a fresh session."
+            )
+        if current_mtime != entry.file_mtime:
+            return (
+                f"File '{entry.file}' has been modified since session start. "
+                f"The proof state may be stale. "
+                f"Use rocq_start to begin a fresh session."
+            )
+    if (
+        lifespan_state is not None
+        and entry.vo_epoch is not None
+        and entry.workspace
+        and _server._current_vo_epoch(lifespan_state, entry.workspace) > entry.vo_epoch
+    ):
         return (
-            f"File '{entry.file}' is no longer accessible. "
-            f"The proof state may be stale. "
-            f"Use rocq_start to begin a fresh session."
-        )
-    if current_mtime != entry.file_mtime:
-        return (
-            f"File '{entry.file}' has been modified since session start. "
-            f"The proof state may be stale. "
-            f"Use rocq_start to begin a fresh session."
+            f"A dependency .vo in workspace '{entry.workspace}' was rebuilt "
+            f"since this session started, so its held environment may be stale "
+            f"and 'proof_finished' here can diverge from a clean compile. "
+            f"Re-verify with rocq_compile_file, or rocq_start for a fresh session."
         )
     return None
 
@@ -629,7 +668,7 @@ async def run_query(
             # symbols against the new file's environment.  Surface a
             # warning so the agent knows the state may not match the
             # source they're reading.
-            stale_warning = _check_staleness(entry)
+            stale_warning = _check_staleness(entry, lifespan_state)
         elif file:
             try:
                 state = _get_file_end_state(pet, file, workspace, lifespan_state)
@@ -1355,6 +1394,7 @@ def _build_position_start_result(
         step=0,
         file_mtime=file_mtime,
         resolved_file=tracked_file,
+        vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
     goals, focus_depth = _try_get_goals_with_depth(pet, state)
     result: dict[str, Any] = {
@@ -1424,6 +1464,7 @@ def _build_theorem_start_result(
         step=0,
         file_mtime=file_mtime,
         resolved_file=resolved_file,
+        vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
     goals, focus_depth = _try_get_goals_with_depth(pet, state)
     result: dict[str, Any] = {
@@ -1459,6 +1500,7 @@ def _build_preamble_start_result(
         parent_id=None,
         tactic=None,
         step=0,
+        vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
     return {
         "success": True,
@@ -1679,6 +1721,9 @@ def _run_one_check_command(
             step=entry.step + command_index + 1,
             file_mtime=entry.file_mtime,
             resolved_file=entry.resolved_file,
+            # Inherit the lineage epoch (fallback if the immediate parent was
+            # evicted); _state_add still prefers the live parent's value.
+            vo_epoch=entry.vo_epoch,
         )
         return new_state, new_state_id, feedback_entry, None
     except PetanqueError as e:
@@ -1875,7 +1920,7 @@ async def run_check(
                 re_err or "Internal: state lost.",
             )
 
-        stale_warning = _check_staleness(entry_to_use)
+        stale_warning = _check_staleness(entry_to_use, lifespan_state)
         start_time = time.monotonic()
         _server._set_workspace_if_needed(pet, entry_to_use.workspace, lifespan_state)
 
@@ -2027,7 +2072,7 @@ async def run_step_multi(
         parent_state = entry_to_use.state
 
         # Check for file staleness (non-blocking warning)
-        stale_warning = _check_staleness(entry_to_use)
+        stale_warning = _check_staleness(entry_to_use, lifespan_state)
 
         total_feedback_size = 0
 

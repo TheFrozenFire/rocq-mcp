@@ -1,5 +1,5 @@
 """Real-pet integration tests for Phase 1 features that were previously
-mock-only — closes audit finding #9.
+mock-only.
 
 Each Phase 1 feature claimed to be load-bearing in production but had
 zero coverage against a real pet subprocess:

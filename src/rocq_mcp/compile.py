@@ -55,50 +55,30 @@ _PROOF_FILE_LABEL: str = "<proof>"
 # ---------------------------------------------------------------------------
 
 
-def _run_coqc_process(
-    file_path: str,
-    workspace: Path,
+def _run_build_subprocess(
+    args: list[str],
+    cwd: str,
     timeout: int,
-    mode: str = "full",
-    timing: bool = False,
 ) -> dict[str, Any]:
-    """Run coqc on a .v file and return the result.
+    """Run *args* under *cwd* with graceful SIGTERM → SIGKILL timeout escalation.
 
-    Shared subprocess management for both :func:`_run_coqc` (temp files) and
-    :func:`_run_coqc_file` (user files).  Handles timeout with graceful
-    SIGTERM → SIGKILL escalation.
+    Shared by :func:`_run_coqc_process` (coqc) and :func:`_run_dune_build`
+    (``dune build``) — both are long-running Rocq compiles that must not
+    wedge the server on a diverging tactic.  On timeout the partial output
+    buffers are still returned so the last completed sentence stays
+    recoverable.
 
-    When ``mode == "vos"`` passes ``-vos`` to coqc, which skips proof
-    bodies (produces a ``.vos`` artifact instead of ``.vo``).
-
-    When *timing* is True, coqc is invoked with ``-time`` so per-sentence
-    timing diagnostics are emitted on stdout (coqc 9.x; older builds may
-    have used stderr — :func:`_parse_timing_lines` tries stdout first and
-    falls back to stderr).  On timeout the partial buffers are still
-    returned so the last completed sentence remains recoverable.
-
-    Returns dict with keys:
-        returncode: int
-        stdout: str
-        stderr: str
-        timed_out: bool
+    Returns dict with keys ``returncode`` / ``stdout`` / ``stderr`` /
+    ``timed_out``.  A missing / unexecutable ``args[0]`` yields
+    ``returncode == -1`` with the reason in ``stderr``.
     """
-    coqc_args: list[str] = [
-        _server.ROCQ_COQC_BINARY,
-        *_server._parse_project_flags(workspace),
-    ]
-    if mode == "vos":
-        coqc_args.append("-vos")
-    if timing:
-        coqc_args.append("-time")
-    coqc_args.append(file_path)
     try:
         proc = subprocess.Popen(
-            coqc_args,
+            args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(workspace),
+            cwd=cwd,
             start_new_session=True,
         )
         try:
@@ -139,17 +119,67 @@ def _run_coqc_process(
                 "timed_out": True,
             }
     except (FileNotFoundError, OSError) as e:
-        coqc_bin = _server.ROCQ_COQC_BINARY
         return {
             "returncode": -1,
             "stdout": "",
             "stderr": (
-                f"{coqc_bin} not found or not executable: {e}"
+                f"{args[0]} not found or not executable: {e}"
                 if isinstance(e, FileNotFoundError)
-                else f"Failed to run {coqc_bin}: {e}"
+                else f"Failed to run {args[0]}: {e}"
             ),
             "timed_out": False,
         }
+
+
+def _run_coqc_process(
+    file_path: str,
+    workspace: Path,
+    timeout: int,
+    mode: str = "full",
+    timing: bool = False,
+    output: str | None = None,
+) -> dict[str, Any]:
+    """Run coqc on a .v file and return the result.
+
+    Shared subprocess management for both :func:`_run_coqc` (temp files) and
+    :func:`_run_coqc_file` (user files).  Handles timeout with graceful
+    SIGTERM → SIGKILL escalation.
+
+    When ``mode == "vos"`` passes ``-vos`` to coqc, which skips proof
+    bodies (produces a ``.vos`` artifact instead of ``.vo``).
+
+    When *timing* is True, coqc is invoked with ``-time`` so per-sentence
+    timing diagnostics are emitted on stdout (coqc 9.x; older builds may
+    have used stderr — :func:`_parse_timing_lines` tries stdout first and
+    falls back to stderr).  On timeout the partial buffers are still
+    returned so the last completed sentence remains recoverable.
+
+    When *output* is given, coqc is passed ``-o <output>`` so the compiled
+    ``.vo``/``.vos`` (and its sibling ``.glob``/``.aux``) land there rather
+    than next to the source — used to target a dune ``_build/default`` path
+    so the source tree stays free of ``.vo`` shadows.  coqc
+    derives the module's logical name from the *output* path relative to the
+    ``-R``/``-Q`` roots, so the caller must place *output* under the
+    load-path root that maps to the file's logical prefix.
+
+    Returns dict with keys:
+        returncode: int
+        stdout: str
+        stderr: str
+        timed_out: bool
+    """
+    coqc_args: list[str] = [
+        _server.ROCQ_COQC_BINARY,
+        *_server._parse_project_flags(workspace),
+    ]
+    if mode == "vos":
+        coqc_args.append("-vos")
+    if timing:
+        coqc_args.append("-time")
+    if output is not None:
+        coqc_args += ["-o", output]
+    coqc_args.append(file_path)
+    return _run_build_subprocess(coqc_args, str(workspace), timeout)
 
 
 def _run_coqc(source: str, workspace: str, timeout: int) -> dict[str, Any]:
@@ -178,6 +208,7 @@ def _run_coqc_file(
     keep_vo: bool = False,
     mode: str = "full",
     timing: bool = False,
+    output: str | None = None,
 ) -> dict[str, Any]:
     """Run coqc on an existing .v file, return result dict.
 
@@ -196,10 +227,19 @@ def _run_coqc_file(
     When *timing* is True, coqc is invoked with ``-time`` and its
     per-sentence timing lines land in the returned ``stderr`` for the
     caller to parse via :func:`_parse_timing_lines`.
+
+    When *output* is given it is forwarded to coqc as ``-o`` (see
+    :func:`_run_coqc_process`).  coqc then writes *every* artifact next to
+    *output* (a dune ``_build/default`` path), so the source-tree cleanup
+    below finds nothing to remove — the ``_build`` artifacts are left in
+    place regardless of *keep_vo* (they belong to the build dir, and after
+    ``dune``-style load-path resolution siblings import them from there).
     """
     ws = Path(workspace).resolve()
     try:
-        return _run_coqc_process(file_path, ws, timeout, mode=mode, timing=timing)
+        return _run_coqc_process(
+            file_path, ws, timeout, mode=mode, timing=timing, output=output
+        )
     finally:
         base = Path(file_path).with_suffix("")
         for ext in _server._CLEANUP_EXTENSIONS:
@@ -527,6 +567,24 @@ def _format_last_completed_phrase(entry: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _truncate_error_text(text: str, include_warnings: bool) -> str:
+    """Normalize a raw stderr blob for a compile-error ``error`` field.
+
+    Drops warning lines when *include_warnings* is False, then tail-truncates
+    to :data:`_MAX_ERROR_LENGTH` (keeping the end, where the actual error
+    sits).  Dropping before truncating preserves more of the error tail than
+    the reverse.  Shared by :func:`_build_compile_result`'s no-position
+    fallback and :func:`_dune_dependency_error_result` so the truncation
+    policy cannot drift between them.
+    """
+    text = text.strip()
+    if not include_warnings:
+        text = _drop_warning_lines(text).strip()
+    if len(text) > _MAX_ERROR_LENGTH:
+        text = text[-_MAX_ERROR_LENGTH:]
+    return text
+
+
 def _build_compile_result(
     result: dict[str, Any],
     source: str,
@@ -609,14 +667,13 @@ def _build_compile_result(
         file_label=file_label,
     )
     if not error_text:
-        raw = stderr_for_format.strip()
-        fallback = raw[-_MAX_ERROR_LENGTH:] if len(raw) > _MAX_ERROR_LENGTH else raw
+        raw = stderr_for_format
         if clean_tmp_paths:
-            fallback = _TMP_PATH_RE.sub(f'"{file_label}"', fallback).strip()
-        else:
-            fallback = fallback.strip()
-        if not include_warnings:
-            fallback = _drop_warning_lines(fallback)
+            # Scrub tmp paths before truncation so paths in the tail are
+            # cleaned too (regex is line-local, so ordering vs. warning-drop
+            # doesn't matter for the surviving lines).
+            raw = _TMP_PATH_RE.sub(f'"{file_label}"', raw)
+        fallback = _truncate_error_text(raw, include_warnings)
         if not fallback:
             fallback = f"coqc exited with code {result['returncode']} (no stderr)."
         fallback_result: dict[str, Any] = {
@@ -689,6 +746,146 @@ def run_compile(
 
 
 # ---------------------------------------------------------------------------
+# dune-build integration
+# ---------------------------------------------------------------------------
+
+# dune reports this when asked to build a target it has no rule for — i.e. the
+# ``.v`` is not part of any ``(coq.theory)`` / ``(rocq.theory)`` stanza (a
+# scratch file, or one missing from an explicit ``(modules …)``).  It is the
+# signal to fall back to a direct coqc compile.
+_DUNE_RULE_MISSING_MARKER = "Don't know how to build"
+
+
+def _dune_target_relpath(dune_root: Path, file_path: str, suffix: str) -> str | None:
+    """Return *file_path*'s dune target relative to *dune_root*, or None.
+
+    e.g. ``theory/use.v`` under root ``/proj`` with ``suffix=".vo"`` ->
+    ``"theory/use.vo"``.  Returns None when *file_path* is outside
+    *dune_root* (dune only knows targets within its own tree).
+    """
+    try:
+        rel = Path(file_path).resolve().relative_to(dune_root.resolve())
+    except ValueError:
+        return None
+    return str(rel.with_suffix(suffix))
+
+
+def _dune_build_output(dune_root: Path, file_path: str, suffix: str) -> Path | None:
+    """Return the ``_build/default/…`` artifact path for a coqc ``-o`` target.
+
+    Mirrors dune's build layout: a source at ``<root>/theory/use.v`` builds to
+    ``<root>/_build/default/theory/use.vo``.  Returns None when *file_path* is
+    outside *dune_root*.
+    """
+    rel = _dune_target_relpath(dune_root, file_path, suffix)
+    if rel is None:
+        return None
+    return dune_root.resolve() / "_build" / "default" / rel
+
+
+def _clear_output_artifacts(out: Path, mode: str) -> None:
+    """Remove the artifacts coqc's ``-o`` compile will (re)write at *out*.
+
+    dune writes its ``_build/default`` artifacts read-only (and may hardlink
+    them from a shared cache), so coqc's ``-o`` cannot overwrite the
+    read-only ``.glob``/``.vos`` sibling and fails with a permission error.
+    Unlinking first — the containing dir is writable — lets coqc regenerate
+    them.  Crucially this *removes the directory entry* rather than writing
+    through it, so any dune cache hardlink stays intact.
+
+    Clears **only the set coqc recreates for this mode** — full compiles the
+    whole ``.vo``/``.vok``/``.vos``/``.glob`` family (+ dot-prefixed
+    ``.<name>.aux``); ``vos`` writes only the ``.vos``.  This matters:
+    deleting a dune-tracked artifact that coqc will *not* recreate (e.g. the
+    ``.vo`` in ``vos`` mode) desyncs dune's digest-db — dune then believes
+    the target still exists and will not rebuild it until ``dune clean``.
+    On a successful compile every cleared file is recreated, so dune
+    re-syncs (content mismatch) on its next build; missing files are ignored
+    (the common scratch-file case, where nothing was there to begin with).
+    """
+    stem = out.with_suffix("")
+    if mode == "vos":
+        # coqc -vos emits only the .vos (no .glob/.vok/.aux); leave dune's
+        # .vo untouched so its digest-db stays in sync.
+        stem.with_suffix(".vos").unlink(missing_ok=True)
+        return
+    for ext in _VO_FAMILY + (".glob",):
+        stem.with_suffix(ext).unlink(missing_ok=True)
+    # coqc's aux file is dot-prefixed: ``.<name>.aux``.
+    (stem.parent / f".{stem.name}.aux").unlink(missing_ok=True)
+
+
+def _run_dune_build(dune_root: Path, target: str, timeout: int) -> dict[str, Any]:
+    """Run ``dune build <target>`` from *dune_root*.
+
+    Returns a coqc-shaped result dict (``returncode`` / ``stdout`` /
+    ``stderr`` / ``timed_out``) — dune emits coqc's own diagnostics
+    verbatim, so the result feeds straight into :func:`_build_compile_result`
+    — plus ``rule_missing``: True when dune has no rule for *target* (the
+    file is not part of a stanza), the signal to fall back to coqc.
+    """
+    # "dune" on PATH — matches the existing ``dune {coq,rocq} top`` invocations
+    # in server._run_dune_coq_top (dune is not a configurable binary here).
+    result = _run_build_subprocess(
+        ["dune", "build", target],
+        str(dune_root),
+        timeout,
+    )
+    result["rule_missing"] = _DUNE_RULE_MISSING_MARKER in result.get("stderr", "")
+    return result
+
+
+_DUNE_FILE_HEADER_RE = re.compile(r'File "([^"]+)"')
+
+
+def _dune_error_targets_file(stderr: str, dune_root: Path, file_path: str) -> bool:
+    """True iff dune's error output points at *file_path* (the requested file).
+
+    ``dune build`` compiles the target's whole dependency closure, so a
+    failure can be located in a *dependency* rather than the requested file.
+    In that case the coqc-style ``File "..."`` header names the other file,
+    and rendering a caret / ``error_positions`` against the requested file's
+    source would mislead.  Returns False when no ``File`` header is present
+    (a dune infrastructure error) so the caller falls back to raw output.
+    """
+    want = Path(file_path).resolve()
+    for m in _DUNE_FILE_HEADER_RE.finditer(stderr):
+        raw = m.group(1)
+        p = Path(raw)
+        if not p.is_absolute():
+            p = dune_root / raw
+        try:
+            if p.resolve() == want:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _dune_dependency_error_result(
+    stderr: str, include_warnings: bool
+) -> dict[str, Any]:
+    """Compile-error envelope for a ``dune build`` that failed in a dependency.
+
+    Surfaces dune's own coqc-format diagnostics (which name the correct
+    file) as ``error`` but omits ``error_positions`` — they carry no file
+    field, so an agent would ``rocq_start`` at the wrong file's line.  The
+    ``hint`` points at the dependency named in the error.
+    """
+    text = _truncate_error_text(stderr, include_warnings)
+    return {
+        "success": False,
+        "reason": "compile_error",
+        "error": text or "dune build failed in a dependency.",
+        "hint": (
+            "Compile the dependency named in the error first — dune builds "
+            "the whole dependency closure, so the failure is upstream of the "
+            "requested file."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: rocq_compile_file (core implementation)
 # ---------------------------------------------------------------------------
 
@@ -707,9 +904,21 @@ def run_compile_file(
     Compiles an existing .v file on disk.  Validates that the file is within
     the workspace, checks for forbidden commands, and returns structured errors.
 
-    When *keep_vo* is True, preserves the ``.vo``/``.vok``/``.vos`` outputs;
-    diagnostic artifacts are still cleaned.  Default False preserves today's
-    "clean everything but the source" behavior.
+    In a **dune project** (a ``dune-project`` ancestor is found and
+    ``ROCQ_DUNE_BUILD`` is not ``0``), the compiled ``.vo``/``.vos`` is kept
+    out of the source tree: full-mode in-stanza files build via
+    ``dune build`` (artifacts under ``_build/default/…``), and everything
+    else (scratch files, ``vos``/``timing`` modes) compiles with coqc but
+    ``-o``-redirected into the same ``_build/default`` location.  In this
+    mode *keep_vo* is a no-op — the artifact always lives in ``_build`` and
+    the source tree is never written.  When ``dune build`` cannot build a
+    file (not part of a stanza), the response carries a ``dune_build_warning``
+    noting the coqc fallback.
+
+    When *keep_vo* is True (outside a dune project), preserves the
+    ``.vo``/``.vok``/``.vos`` outputs; diagnostic artifacts are still
+    cleaned.  Default False preserves the "clean everything but the source"
+    behavior.
 
     *mode* selects the coqc pass.  ``"full"`` (default) runs the normal
     compile.  ``"vos"`` adds ``-vos`` so coqc skips proof bodies, which
@@ -752,8 +961,82 @@ def run_compile_file(
     if forbidden:
         return {"success": False, "reason": "validation", "error": forbidden}
 
+    # In a dune project, keep compiled artifacts out of the source tree:
+    # prefer `dune build` (writes to _build/default), and where that can't
+    # be used, still redirect coqc's output there via `-o`.  Both
+    # the dune target and the coqc `-o` output are computed relative to the
+    # dune root, and the coqc fallback compiles with the dune root as its
+    # workspace so its `-R _build/default/...` flags and the `-o` path agree
+    # (coqc derives the module's logical name from the output path).
+    ws = Path(workspace).resolve()
+    dune_root = _server._find_dune_root(ws) if _server._DUNE_BUILD_ENABLED else None
+
+    dune_build_warning: str | None = None
+    coqc_workspace = workspace
+    coqc_output: str | None = None
+
+    if dune_root is not None:
+        out = _dune_build_output(
+            dune_root, file_path, ".vos" if mode == "vos" else ".vo"
+        )
+        if out is not None:
+            # `dune build` is the blessed path but only knows in-stanza files
+            # in full mode; it has no `.vos` target and no per-sentence
+            # timing.  For those, skip straight to the coqc `-o` fallback.
+            if mode == "full" and not timing:
+                target = _dune_target_relpath(dune_root, file_path, ".vo")
+                dres = _run_dune_build(dune_root, target, timeout)
+                if not dres["rule_missing"]:
+                    # dune owns the outcome — success, a real compile error
+                    # (its stderr is coqc's own), or a timeout.  But a failure
+                    # may be located in a *dependency* (dune builds the whole
+                    # closure); a caret / error_positions rendered against the
+                    # requested file's source would then be wrong, so surface
+                    # dune's raw output for that case instead.
+                    if (
+                        dres["returncode"] != 0
+                        and not dres["timed_out"]
+                        and not _dune_error_targets_file(
+                            dres["stderr"], dune_root, file_path
+                        )
+                    ):
+                        return _dune_dependency_error_result(
+                            dres["stderr"], include_warnings
+                        )
+                    return _build_compile_result(
+                        dres,
+                        source,
+                        timeout,
+                        include_warnings,
+                        file_label=file,
+                        clean_tmp_paths=False,
+                    )
+                # dune has no rule for this file (not part of a stanza).
+                dune_build_warning = (
+                    f"dune could not build {target!r} (the file is not part of "
+                    "a dune stanza); compiled it directly with coqc into "
+                    "_build/default instead."
+                )
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                # dune's _build artifacts are read-only; clear any pre-existing
+                # target so coqc's `-o` can write (see _clear_output_artifacts).
+                _clear_output_artifacts(out, mode)
+                coqc_output = str(out)
+                coqc_workspace = str(dune_root)
+            except OSError:
+                # Cannot stage the _build dir — fall back to a plain
+                # source-tree compile rather than failing outright.
+                dune_build_warning = None
+
     result = _run_coqc_file(
-        file_path, workspace, timeout, keep_vo=keep_vo, mode=mode, timing=timing
+        file_path,
+        coqc_workspace,
+        timeout,
+        keep_vo=keep_vo,
+        mode=mode,
+        timing=timing,
+        output=coqc_output,
     )
 
     timing_field: dict[str, Any] | None = None
@@ -771,7 +1054,7 @@ def run_compile_file(
             # drift across versions.  Fall back to an empty timing field.
             timing_field = _build_timing_field([])
 
-    return _build_compile_result(
+    response = _build_compile_result(
         result,
         source,
         timeout,
@@ -780,6 +1063,9 @@ def run_compile_file(
         clean_tmp_paths=False,
         timing_field=timing_field,
     )
+    if dune_build_warning:
+        response["dune_build_warning"] = dune_build_warning
+    return response
 
 
 # ---------------------------------------------------------------------------

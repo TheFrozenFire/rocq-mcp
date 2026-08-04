@@ -191,7 +191,7 @@ class TestCompileFileTimeout:
         monkeypatch.setattr(
             _compile,
             "_run_coqc_file",
-            lambda fp, ws, to, keep_vo=False, mode="full", timing=False: {
+            lambda fp, ws, to, keep_vo=False, mode="full", timing=False, output=None: {
                 "returncode": -1,
                 "stdout": "",
                 "stderr": "",
@@ -686,7 +686,9 @@ class TestTiming:
 
         seen_timing: dict = {"value": None}
 
-        def fake_run(fp, ws, to, keep_vo=False, mode="full", *, timing=False):
+        def fake_run(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
             seen_timing["value"] = timing
             return _fake_coqc_result("", returncode=0)
 
@@ -706,7 +708,9 @@ class TestTiming:
 
         seen_timing: dict = {"value": None}
 
-        def fake_run(fp, ws, to, keep_vo=False, mode="full", *, timing=False):
+        def fake_run(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
             seen_timing["value"] = timing
             return {
                 "returncode": 0,
@@ -899,7 +903,9 @@ class TestTiming:
             "Chars 26 - 34 [exact~I.] 15.3 secs (0.u,0.s)\n"
         )
 
-        def fake_run(fp, ws, to, keep_vo=False, mode="full", *, timing=False):
+        def fake_run(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
             return {
                 "returncode": -1,
                 # coqc 9.x flushes per-sentence timing to stdout before
@@ -1040,7 +1046,9 @@ class TestVosMode:
 
         captured: dict = {}
 
-        def fake_process(file_path, ws, timeout, mode="full", *, timing=False):
+        def fake_process(
+            file_path, ws, timeout, mode="full", *, timing=False, output=None
+        ):
             captured["mode"] = mode
             return {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
 
@@ -1241,3 +1249,427 @@ class TestVosModeIntegration:
         finally:
             for ext in (".vo", ".vok", ".vos", ".glob"):
                 (workspace / f"vos_keep{ext}").unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# dune-build integration
+# ---------------------------------------------------------------------------
+
+
+def _make_dune_project(root):
+    """Create a minimal modern-stanza dune project under *root*.
+
+    Returns the source ``theory/use.v`` path.  The stanza content only
+    matters when ``dune build`` is actually run (these tests mock it).
+    """
+    (root / "dune-project").write_text("(lang dune 3.21)\n(using rocq 0.11)\n")
+    theory = root / "theory"
+    theory.mkdir()
+    (theory / "dune").write_text("(rocq.theory (name mwe) (modules use))\n")
+    (theory / "use.v").write_text("Lemma l : 0 = 0.\nProof. reflexivity. Qed.\n")
+    return theory / "use.v"
+
+
+def _dune_ok():
+    return {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "rule_missing": False,
+    }
+
+
+class TestCompileFileDuneBuild:
+    """rocq_compile_file keeps .vo out of the source tree in dune projects.
+
+    All subprocess layers are mocked, so no real coqc/dune is needed.
+    """
+
+    pytestmark = []  # override module-level coqc skip
+
+    def test_path_helpers(self, tmp_path):
+        from pathlib import Path
+        import rocq_mcp.compile as _compile
+
+        f = str(tmp_path / "theory" / "use.v")
+        assert _compile._dune_target_relpath(tmp_path, f, ".vo") == "theory/use.vo"
+        assert (
+            _compile._dune_build_output(tmp_path, f, ".vo")
+            == tmp_path.resolve() / "_build" / "default" / "theory" / "use.vo"
+        )
+        # A file outside the dune root is not a dune target.
+        outside = str(tmp_path.parent / "elsewhere.v")
+        assert _compile._dune_target_relpath(tmp_path, outside, ".vo") is None
+        assert _compile._dune_build_output(tmp_path, outside, ".vo") is None
+
+    def test_run_dune_build_flags_rule_missing(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        def fake_sub(args, cwd, timeout):
+            assert args[:2] == ["dune", "build"]
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Error: Don't know how to build x.vo\n",
+                "timed_out": False,
+            }
+
+        monkeypatch.setattr(_compile, "_run_build_subprocess", fake_sub)
+        assert _compile._run_dune_build(tmp_path, "x.vo", 30)["rule_missing"] is True
+
+        monkeypatch.setattr(
+            _compile,
+            "_run_build_subprocess",
+            lambda *a, **k: {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+            },
+        )
+        assert _compile._run_dune_build(tmp_path, "x.vo", 30)["rule_missing"] is False
+
+    def test_dune_build_success_skips_coqc(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+        seen = {"target": None, "coqc": False}
+
+        def fake_dune(dune_root, target, timeout):
+            seen["target"] = target
+            return _dune_ok()
+
+        def fake_coqc(*a, **k):
+            seen["coqc"] = True
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is True
+        assert seen["target"] == "theory/use.vo"
+        assert seen["coqc"] is False  # dune handled it; no coqc fallback
+        assert "dune_build_warning" not in result
+
+    def test_dune_compile_error_reported_without_recompile(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+        dune_err = (
+            'File "./theory/use.v", line 2, characters 13-28:\n'
+            "Error: The variable nope was not found in the current environment.\n"
+        )
+        coqc = {"called": False}
+
+        def fake_dune(dune_root, target, timeout):
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": dune_err,
+                "timed_out": False,
+                "rule_missing": False,
+            }
+
+        def fake_coqc(*a, **k):
+            coqc["called"] = True
+            return _fake_coqc_result("")
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is False
+        assert result["reason"] == "compile_error"
+        # dune's stderr is coqc-format, so positions parse straight through.
+        assert result.get("error_positions")
+        assert coqc["called"] is False  # no redundant coqc recompile
+        assert "dune_build_warning" not in result
+
+    def test_rule_missing_falls_back_to_coqc_into_build(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+        seen = {}
+
+        def fake_dune(dune_root, target, timeout):
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Error: Don't know how to build theory/use.vo\n",
+                "timed_out": False,
+                "rule_missing": True,
+            }
+
+        def fake_coqc(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
+            seen["ws"] = ws
+            seen["output"] = output
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is True
+        assert "dune_build_warning" in result
+        # coqc fallback compiles from the dune root, output redirected to _build.
+        assert seen["ws"] == str(tmp_path.resolve())
+        assert seen["output"] == str(
+            tmp_path.resolve() / "_build" / "default" / "theory" / "use.vo"
+        )
+        assert (tmp_path / "_build" / "default" / "theory").is_dir()
+
+    def test_vos_mode_skips_dune_uses_coqc_into_build(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+        seen = {"dune": False}
+
+        def fake_dune(*a, **k):
+            seen["dune"] = True
+            return _dune_ok()
+
+        def fake_coqc(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
+            seen["mode"] = mode
+            seen["output"] = output
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60, mode="vos")
+        assert result["success"] is True
+        assert seen["dune"] is False  # dune has no .vos target
+        assert seen["mode"] == "vos"
+        assert seen["output"].endswith("/_build/default/theory/use.vos")
+        assert "dune_build_warning" not in result
+
+    def test_disabled_uses_source_tree_coqc(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+        import rocq_mcp.server as _server
+
+        _make_dune_project(tmp_path)
+        monkeypatch.setattr(_server, "_DUNE_BUILD_ENABLED", False)
+        seen = {}
+
+        def fake_coqc(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
+            seen["ws"] = ws
+            seen["output"] = output
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+        monkeypatch.setattr(
+            _compile,
+            "_run_dune_build",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("dune must not run when disabled")
+            ),
+        )
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is True
+        assert seen["output"] is None  # legacy source-tree placement
+        assert seen["ws"] == str(tmp_path)
+
+    def test_non_dune_workspace_unaffected(self, tmp_path, monkeypatch):
+        import rocq_mcp.compile as _compile
+
+        # No dune-project marker -> plain coqc, output=None.
+        (tmp_path / "solo.v").write_text("Lemma l : 0 = 0.\nProof. reflexivity. Qed.\n")
+        seen = {}
+
+        def fake_coqc(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
+            seen["output"] = output
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+        result = run_compile_file("solo.v", str(tmp_path), 60)
+        assert result["success"] is True
+        assert seen["output"] is None
+
+    def test_clear_output_artifacts_removes_readonly(self, tmp_path):
+        """coqc -o target artifacts (incl. read-only dune ones) are cleared.
+
+        Full mode clears the whole family coqc regenerates; vos mode clears
+        only the .vos so dune's tracked .vo is not orphaned (digest-db desync).
+        """
+        import os
+        import stat
+        import rocq_mcp.compile as _compile
+
+        family = ("use.vo", "use.vok", "use.vos", "use.glob", ".use.aux")
+
+        def seed(d):
+            d.mkdir(parents=True, exist_ok=True)
+            for name in family:
+                p = d / name
+                p.write_text("x")
+                os.chmod(p, stat.S_IRUSR)  # dune-style read-only
+
+        # full: clears the whole family (all recreated by a full coqc compile).
+        d = tmp_path / "full" / "theory"
+        seed(d)
+        _compile._clear_output_artifacts(d / "use.vo", "full")
+        for name in family:
+            assert not (d / name).exists(), f"full: {name} should be cleared"
+        _compile._clear_output_artifacts(d / "use.vo", "full")  # idempotent
+
+        # vos: clears ONLY the .vos; dune's .vo/.vok/.glob/.aux stay put
+        # (coqc -vos won't recreate them — deleting would desync dune).
+        d2 = tmp_path / "vos" / "theory"
+        seed(d2)
+        _compile._clear_output_artifacts(d2 / "use.vos", "vos")
+        assert not (d2 / "use.vos").exists(), "vos: .vos should be cleared"
+        for name in ("use.vo", "use.vok", "use.glob", ".use.aux"):
+            assert (d2 / name).exists(), f"vos: {name} must be preserved"
+
+    def test_dependency_error_surfaced_without_positions(self, tmp_path, monkeypatch):
+        """A dune failure located in a *dependency* surfaces raw, no positions.
+
+        dune build compiles the whole closure; an error in dep.v must not be
+        rendered against the requested file's source (wrong caret / bogus
+        error_positions that would send an agent to the wrong line).
+        """
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+        # Error names theory/dep.v, NOT the requested theory/use.v.
+        dep_err = (
+            'File "./theory/dep.v", line 5, characters 0-10:\n'
+            "Error: The reference bogus was not found in the current environment.\n"
+        )
+
+        def fake_dune(dune_root, target, timeout):
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": dep_err,
+                "timed_out": False,
+                "rule_missing": False,
+            }
+
+        def fake_coqc(*a, **k):  # must not run — dune owns the outcome
+            raise AssertionError("coqc must not be invoked for a dune dep error")
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is False
+        assert result["reason"] == "compile_error"
+        assert "dep.v" in result["error"]  # dune's raw output names the dep
+        assert "error_positions" not in result  # not misattributed to use.v
+        assert "dependency" in result.get("hint", "")
+
+    def test_mkdir_failure_falls_back_to_source_tree(self, tmp_path, monkeypatch):
+        """If staging _build fails, fall back to source-tree coqc and drop the warning."""
+        from pathlib import Path
+        import rocq_mcp.compile as _compile
+
+        _make_dune_project(tmp_path)
+
+        def fake_dune(dune_root, target, timeout):
+            # rule_missing sets a warning that the OSError arm must reset.
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Error: Don't know how to build theory/use.vo\n",
+                "timed_out": False,
+                "rule_missing": True,
+            }
+
+        def boom(self, *a, **k):
+            raise OSError("cannot create _build")
+
+        seen = {}
+
+        def fake_coqc(
+            fp, ws, to, keep_vo=False, mode="full", *, timing=False, output=None
+        ):
+            seen["ws"] = ws
+            seen["output"] = output
+            return _fake_coqc_result("", returncode=0)
+
+        monkeypatch.setattr(_compile, "_run_dune_build", fake_dune)
+        monkeypatch.setattr(Path, "mkdir", boom)
+        monkeypatch.setattr(_compile, "_run_coqc_file", fake_coqc)
+
+        result = run_compile_file("theory/use.v", str(tmp_path), 60)
+        assert result["success"] is True
+        # Fell back to a plain source-tree compile (no _build redirect).
+        assert seen["output"] is None
+        assert seen["ws"] == str(tmp_path)
+        # The rule-missing warning was reset — we did not redirect to _build.
+        assert "dune_build_warning" not in result
+
+    @pytest.mark.skipif(not COQC_AVAILABLE, reason="coqc not available")
+    def test_vos_fallback_preserves_dune_vo(self, tmp_path):
+        """Real dune+coqc: a vos-mode fallback must not orphan dune's .vo.
+
+        Regression for the digest-db desync: clearing the .vo (which coqc
+        -vos never recreates) would leave dune believing it still exists and
+        refusing to rebuild it. End-to-end: dune's .vo survives and a later
+        dune build still succeeds.
+        """
+        import shutil
+        import subprocess
+
+        if not shutil.which("dune"):
+            pytest.skip("dune not available")
+        _make_dune_project(tmp_path)
+        r = subprocess.run(
+            ["dune", "build", "theory/use.vo"], cwd=tmp_path, capture_output=True
+        )
+        assert r.returncode == 0, r.stderr
+        vo = tmp_path / "_build" / "default" / "theory" / "use.vo"
+        assert vo.is_file()
+
+        # vos has no dune target -> coqc -o fallback into _build/default.
+        result = run_compile_file("theory/use.v", str(tmp_path), 60, mode="vos")
+        assert result["success"] is True, result
+        assert vo.is_file(), "vos fallback must not delete dune's .vo"
+        assert (tmp_path / "_build" / "default" / "theory" / "use.vos").is_file()
+        # Source tree stays clean; a later dune build still works.
+        assert not (tmp_path / "theory" / "use.vo").exists()
+        r2 = subprocess.run(
+            ["dune", "build", "theory/use.vo"], cwd=tmp_path, capture_output=True
+        )
+        assert r2.returncode == 0, r2.stderr
+        assert vo.is_file()
+
+    @pytest.mark.skipif(not COQC_AVAILABLE, reason="coqc not available")
+    def test_timing_fallback_over_readonly_build(self, tmp_path):
+        """Real dune+coqc: timing fallback overwrites read-only _build artifacts
+        (via _clear_output_artifacts on the happy path) and leaves dune buildable."""
+        import shutil
+        import subprocess
+
+        if not shutil.which("dune"):
+            pytest.skip("dune not available")
+        _make_dune_project(tmp_path)
+        r = subprocess.run(
+            ["dune", "build", "theory/use.vo"], cwd=tmp_path, capture_output=True
+        )
+        assert r.returncode == 0, r.stderr
+        vo = tmp_path / "_build" / "default" / "theory" / "use.vo"
+
+        # timing forces the coqc -o fallback even for an in-stanza file whose
+        # _build/.vo is present and read-only.
+        result = run_compile_file("theory/use.v", str(tmp_path), 60, timing=True)
+        assert result["success"] is True, result
+        assert "timing" in result
+        assert vo.is_file()
+        assert not (tmp_path / "theory" / "use.vo").exists()  # source tree clean
+        r2 = subprocess.run(
+            ["dune", "build", "theory/use.vo"], cwd=tmp_path, capture_output=True
+        )
+        assert r2.returncode == 0, r2.stderr

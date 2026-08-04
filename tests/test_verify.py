@@ -2620,7 +2620,7 @@ class TestVerifyCleanup:
 
 
 # ---------------------------------------------------------------------------
-# Unified envelope contract (Audit finding #4)
+# Unified envelope contract
 # ---------------------------------------------------------------------------
 
 

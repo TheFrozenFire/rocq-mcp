@@ -1159,7 +1159,7 @@ class TestQueryFromStateIntegration:
 
 
 # ---------------------------------------------------------------------------
-# LSP DiagnosticSeverity wire convention (Audit finding #2)
+# LSP DiagnosticSeverity wire convention
 # ---------------------------------------------------------------------------
 
 

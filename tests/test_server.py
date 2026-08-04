@@ -883,9 +883,9 @@ class TestParseDuneFlags:
     def test_dune_rocq_top_fallback_when_coq_top_fails(self, tmp_path):
         """A ``(rocq.theory ...)`` project (``dune coq top`` fails) uses ``rocq top``.
 
-        Regression test for issue #34: modern ``(using rocq ...)`` dune
-        projects were undetected, so pet fell back to a single-theory load
-        path and cross-theory ``Require``s silently failed.
+        Modern ``(using rocq ...)`` dune projects were otherwise undetected,
+        so pet fell back to a single-theory load path and cross-theory
+        ``Require``s silently failed.
         """
         (tmp_path / "dune-project").write_text("(lang dune 3.21)\n(using rocq 0.11)\n")
         (tmp_path / "theory").mkdir()

@@ -149,6 +149,14 @@ _COMPILE_MULTI_ERROR_TIMEOUT: float = float(
     os.environ.get("ROCQ_COMPILE_MULTI_ERROR_TIMEOUT", "5.0")
 )
 
+# When True (default) and the compiled file lives in a dune project,
+# ``rocq_compile_file`` builds via ``dune build`` so the ``.vo`` lands in
+# ``_build/default/…`` instead of shadowing the source tree; the coqc
+# fallback (scratch files, ``vos``/``timing`` modes) redirects its output
+# there too via ``-o``.  Set ``ROCQ_DUNE_BUILD=0`` to force the legacy
+# coqc-into-source-tree behavior everywhere.
+_DUNE_BUILD_ENABLED: bool = os.environ.get("ROCQ_DUNE_BUILD", "1") != "0"
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -1100,7 +1108,7 @@ def _set_workspace_if_needed(
     materialised on disk *before* coq-lsp indexes the workspace.
     Without this, pet-based tools on a fresh dune workspace would see a
     workspace with no project file, falling back to single-theory load
-    paths and breaking cross-theory imports (pytanque issue #17).
+    paths and breaking cross-theory imports (an upstream pytanque limitation).
     """
     ws = str(Path(workspace).resolve())
     if lifespan_state.get("current_workspace") != ws:
@@ -1876,14 +1884,29 @@ async def rocq_compile_file(
     max entries) and ``ROCQ_COMPILE_MULTI_ERROR_TIMEOUT`` (default
     5.0s, per-``pet.run`` budget inside the walker).
 
-    Compilation artifacts (``.vo``/``.vok``/``.vos``/``.glob``/``.aux``)
-    are cleaned up by default; the source file is preserved.  Set
-    ``keep_vo=True`` to retain the compiled-artifact family
-    (``.vo``/``.vok``/``.vos``) while still cleaning the diagnostic
-    artifacts (``.glob``/``.aux``/``.vio``/``.timing``/``.coqaux``).
-    Typical use: compiling a file whose ``.vo`` will be imported by a
-    sibling ``.v`` in the same workspace, or incremental compile loops
-    that want to avoid rebuilding unchanged dependencies.
+    **In a dune project** (a ``dune-project`` ancestor is found), the
+    compiled ``.vo``/``.vos`` is written to dune's ``_build/default/…``
+    instead of next to the source, so it never shadows a pre-built artifact
+    in the source tree.  Full-mode files that are part of a
+    stanza build via ``dune build``; scratch files and ``vos``/``timing``
+    modes compile with coqc redirected (``-o``) into the same
+    ``_build/default`` path.  In this mode the ``.vo`` is always retained in
+    ``_build`` (usable by sibling ``Require``s once the workspace's load
+    path points there — see the dune load-path note under *Prerequisites*),
+    so ``keep_vo`` has no effect.  When ``dune build`` cannot build a file
+    (it is not part of a stanza), the response carries a
+    ``dune_build_warning`` string noting that coqc was used instead.  Set
+    ``ROCQ_DUNE_BUILD=0`` to force the legacy coqc-into-source-tree behavior.
+
+    Outside a dune project, compilation artifacts
+    (``.vo``/``.vok``/``.vos``/``.glob``/``.aux``) are cleaned up by
+    default and the source file is preserved.  Set ``keep_vo=True`` to
+    retain the compiled-artifact family (``.vo``/``.vok``/``.vos``) while
+    still cleaning the diagnostic artifacts
+    (``.glob``/``.aux``/``.vio``/``.timing``/``.coqaux``).  Typical use:
+    compiling a file whose ``.vo`` will be imported by a sibling ``.v`` in
+    the same workspace, or incremental compile loops that want to avoid
+    rebuilding unchanged dependencies.
 
     When the call rewrites ``.vo`` files in a workspace that has active
     interactive sessions, the result also includes ``vo_rebuild_warning``:
@@ -1911,7 +1934,10 @@ async def rocq_compile_file(
             after coqc returns (diagnostic artifacts are still cleaned).
             Default False matches today's "clean everything but the
             source" behavior.  Useful when a sibling file in the same
-            workspace will ``Require Import`` the result.  **Note**:
+            workspace will ``Require Import`` the result.  **No-op in a
+            dune project** — there the artifact always lives in
+            ``_build/default`` (never the source tree), so nothing is
+            cleaned regardless; see the dune paragraph above.  **Note**:
             combining ``keep_vo=True`` with ``mode="vos"`` produces
             only a ``.vos`` artifact; downstream files compiled in
             ``mode="full"`` will fail with ``"Unable to locate
@@ -1944,10 +1970,17 @@ async def rocq_compile_file(
     The response envelope additionally carries several optional fields
     depending on flags / failure mode: ``error_positions`` and
     ``state_capture_status`` on ``reason="compile_error"`` (see the
-    ``state_capture_status`` paragraph above); ``errors`` per-declaration
+    ``state_capture_status`` paragraph above) — **except** when a dune build
+    fails inside a *dependency* rather than the requested file: that case
+    still returns ``reason="compile_error"`` but omits ``error_positions``
+    (they carry no filename and would point into the wrong file) and instead
+    carries a ``hint`` naming the dependency to fix first; read the file name
+    from the ``error`` text.  Also: ``errors`` per-declaration
     list when ``pet`` is available (see the Multi-error callout in the
     README); ``vo_rebuild_warning`` when the call rewrites ``.vo``
-    artifacts in a workspace with active sessions; ``clamped_timeout``
+    artifacts in a workspace with active sessions; ``dune_build_warning``
+    when a dune project file could not be built by ``dune build`` and coqc
+    was used instead (see the dune paragraph above); ``clamped_timeout``
     when the per-call timeout was clamped by ``ROCQ_QUERY_TIMEOUT_CAP``;
     ``timing`` when ``timing=True``.
 

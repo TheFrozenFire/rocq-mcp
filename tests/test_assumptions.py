@@ -1145,7 +1145,7 @@ class TestCollectTocNames:
         assert names == ["top"]
 
     def test_declarative_one_liner_does_not_corrupt_parent_qualifier(self):
-        """Audit-fix #2 reproducer.  ``Module M : MT.`` is a declarative
+        """``Module M : MT.`` is a declarative
         one-liner: it has no body and no ``End M.``.  The opener regex
         cannot distinguish it from a real opener, so it gets pushed
         onto the stack.  When ``End Outer.`` later fires, we must scan

@@ -676,3 +676,51 @@ class TestMultiErrorEnvelopeContract:
             assert "theorem" in result
         # ... and the new errors field coexists with them.
         assert "errors" in result
+
+
+# ---------------------------------------------------------------------------
+# Walker timeout budget (no coqc/pet needed — _run_with_pet is mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestWalkerTimeoutBudget:
+    """The walker budget must follow ``ROCQ_COMPILE_MULTI_ERROR_TIMEOUT`` so
+    raising it for a heavy project (e.g. a slow VST ``Require``) actually
+    takes effect instead of being silently clamped by the default ceiling
+    (issue #29)."""
+
+    pytestmark = []  # override module coqc/pet skip
+
+    def _captured_timeout(self, tmp_path, monkeypatch, per_call, cap):
+        import asyncio
+        import rocq_mcp.server as _server
+        import rocq_mcp.compile_enrichment as _ce
+
+        f = tmp_path / "x.v"
+        f.write_text("Definition x := 1.\n")
+        monkeypatch.setattr(_server, "_COMPILE_MULTI_ERROR_TIMEOUT", per_call)
+        monkeypatch.setattr(_server, "_COMPILE_MULTI_ERROR_CAP", cap)
+
+        seen = {}
+
+        async def fake_run_with_pet(fn, ls, tool, *, timeout, auto_record):
+            seen["timeout"] = timeout
+            return []
+
+        monkeypatch.setattr(_server, "_run_with_pet", fake_run_with_pet)
+        asyncio.run(_ce._multi_error_walk(str(f), make_lifespan_state()))
+        return seen["timeout"], _ce
+
+    def test_default_budget_unchanged(self, tmp_path, monkeypatch):
+        t, _ce = self._captured_timeout(tmp_path, monkeypatch, per_call=5.0, cap=20)
+        ceiling = _ce._ENRICHMENT_TIMEOUT_CAP * _ce._WALKER_BUDGET_MULTIPLIER
+        # per_call*2 (10) < ceiling (20), so the default ceiling still wins.
+        assert t == ceiling
+
+    def test_raised_per_call_lifts_budget(self, tmp_path, monkeypatch):
+        t, _ce = self._captured_timeout(tmp_path, monkeypatch, per_call=30.0, cap=20)
+        ceiling = _ce._ENRICHMENT_TIMEOUT_CAP * _ce._WALKER_BUDGET_MULTIPLIER
+        # per_call*2 (60) now exceeds the default ceiling, so the walker
+        # follows the raised knob (a slow import chunk can complete).
+        assert t == 60.0
+        assert t > ceiling

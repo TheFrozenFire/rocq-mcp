@@ -333,12 +333,15 @@ async def _multi_error_walk(
 
     # Walker budget: generous enough that pet.toc + ``cap`` chunked runs
     # each at ``per_call_timeout`` can complete, plus headroom for the
-    # lock/setup overhead.  Capped by the outer ceiling
+    # lock/setup overhead.  Bounded by the outer ceiling
     # ``_ENRICHMENT_TIMEOUT_CAP * _WALKER_BUDGET_MULTIPLIER`` so a
-    # misconfigured CAP cannot starve the agent.
+    # misconfigured CAP cannot starve the agent — but never below two full
+    # ``per_call_timeout``s, so raising ``ROCQ_COMPILE_MULTI_ERROR_TIMEOUT``
+    # for a heavy project (e.g. a slow VST ``Require``) actually takes effect
+    # rather than being silently clamped by the default ceiling.
     walker_timeout = min(
         per_call_timeout * max(cap, 1) + per_call_timeout,
-        _ENRICHMENT_TIMEOUT_CAP * _WALKER_BUDGET_MULTIPLIER,
+        max(_ENRICHMENT_TIMEOUT_CAP * _WALKER_BUDGET_MULTIPLIER, per_call_timeout * 2),
     )
 
     result = await _server._run_with_pet(

@@ -1,9 +1,11 @@
 """Chunked pet.run multi-error walker.
 
 Given a Rocq source file and an open pet (pytanque) client, walks the file
-incrementally using ``pet.get_root_state`` + chunked ``pet.run`` and reports
-every error encountered, attributing each one to its surrounding proof when
-possible.
+incrementally using ``pet.get_root_state`` + chunked ``pet.run``, attributing
+each error to its surrounding proof when possible.  The walk is fail-fast at
+the top level: it stops at the first inter-chunk / whole-file error (see
+:func:`collect_file_errors`) rather than reporting the cascade that follows a
+broken ``Require`` / ``Import`` / ``Notation``.
 
 The module is intentionally self-contained: it imports nothing from the
 rest of ``rocq_mcp``. ``pytanque`` is also optional — the ``PetanqueError``
@@ -39,6 +41,15 @@ _WALKABLE_DETAILS = frozenset(
 )
 
 _CLOSERS = ("Qed.", "Defined.", "Admitted.", "Abort.", "Save.")
+
+# Chunk kinds that are NOT a single named declaration: inter-chunk vernaculars
+# (a broken ``Require`` / ``Import`` / ``Notation`` …) and the whole-file
+# fallback.  An error in one of these poisons the environment for every chunk
+# after it, so the walk stops there rather than emitting a "not found" cascade.
+# Note: named declarations (``Definition``/``Fixpoint``/``Instance``/proofs)
+# are their own walkable chunks and are NOT in this set — a failure there does
+# not stop the walk.
+_TOP_LEVEL_KINDS = frozenset({"<top-level>", "<file>"})
 
 
 @dataclass(frozen=True)
@@ -266,6 +277,14 @@ def collect_file_errors(
 
     ``max_errors`` caps the result list to avoid runaway on adversarial
     files.
+
+    The walk **stops at the first top-level / inter-chunk error** (a broken
+    ``Require`` / ``Import`` / ``Notation``): such a failure poisons the
+    environment for every later chunk, which would otherwise report a
+    cascade of "reference/library not found" errors that bury the real one.
+    Errors inside independent named declarations still accumulate up to
+    ``max_errors`` (a failed named ``Definition``/``Fixpoint``/proof is its
+    own chunk and does not stop the walk).
     """
     try:
         from pytanque import PetanqueError  # type: ignore[import-not-found]
@@ -315,6 +334,15 @@ def collect_file_errors(
                 )
             )
             if len(errors) >= max_errors:
+                break
+            # A failure in a top-level / inter-chunk region (a broken
+            # ``Require``, ``Import``, ``Notation`` …) changes the
+            # environment for everything after it, so subsequent chunks fail
+            # with cascade "reference/library not found" errors that bury the
+            # real cause.  Stop here — coqc's own first-error report
+            # (``error_positions``) already carries it, and matching coqc's
+            # fail-fast keeps ``errors`` to the genuine problem.
+            if chunk.kind in _TOP_LEVEL_KINDS:
                 break
             if idx + 1 >= len(chunks):
                 break

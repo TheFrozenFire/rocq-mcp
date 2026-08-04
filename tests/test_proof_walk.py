@@ -333,6 +333,42 @@ class TestResume:
         assert errs[0].proof_name == "t1"
 
 
+class TestTopLevelCascade:
+    def test_top_level_error_stops_walk(self) -> None:
+        """A broken inter-chunk vernacular (e.g. a failed ``Require``) stops
+        the walk so downstream chunks don't produce a "not found" cascade.
+
+        Regression for the ``*.imports``-not-found flood (issue #29): the
+        leading ``<top-level>`` chunk fails, and the later named proofs —
+        which would each error with cascade "reference not found" — are not
+        even attempted.
+        """
+        source = (
+            "Require Import does_not_exist.\n"  # 0  -> <top-level> chunk
+            "Theorem t1 : True.\nProof. trivial. Qed.\n"  # 1-2
+            "Theorem t2 : True.\nProof. trivial. Qed.\n"  # 3-4
+        )
+        elements = [
+            _make_toc_element("t1", "Theorem", 1),
+            _make_toc_element("t2", "Theorem", 3),
+        ]
+
+        def handler(state: Any, body: str, t: Any) -> Any:
+            # Everything fails (the Require, then every cascade); the walk
+            # must stop at the top-level failure regardless.
+            raise _FakePetanqueError("Unable to locate library does_not_exist")
+
+        pet = _MockPet(toc_result=_toc(elements), run_handler=handler)
+        errs = collect_file_errors("f.v", source, pet)
+        assert errs is not None and len(errs) == 1
+        assert errs[0].kind == "<top-level>"
+        assert errs[0].proof_name is None
+        # Only the top-level chunk was submitted; the named proofs (which
+        # would cascade) were never run, and no resume was attempted.
+        assert len(pet.calls) == 1
+        assert pet.resume_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: chunk-builder edge cases
 # ---------------------------------------------------------------------------

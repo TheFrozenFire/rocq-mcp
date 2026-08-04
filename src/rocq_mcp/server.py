@@ -1874,7 +1874,13 @@ async def rocq_compile_file(
     Each entry is ``{proof_name, kind, start_line, end_line, code,
     message}``.  Complements ``error_positions`` — the latter is
     coqc's raw parse of the first diagnostic, while ``errors`` is
-    pet's structured walk of the whole file.  The field may be
+    pet's structured walk of the whole file.  The walk stops at the
+    first top-level / inter-chunk error (a broken ``Require`` /
+    ``Import`` / ``Notation``) rather than emitting the downstream
+    "reference/library not found" cascade it would otherwise poison every
+    later declaration with; errors in independent named declarations still
+    accumulate.
+    The field may be
     *present and empty* (``errors: []``) when the walker ran but pet
     did not reproduce the coqc-reported failure — treat this as "no
     additional errors found" rather than "no errors at all."  Absent

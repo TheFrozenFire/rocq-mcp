@@ -456,11 +456,18 @@ class TestRecentErrors:
         mock_pet = _mock_pet()
         ls = _fresh_lifespan_state()
         ls["pet_client"] = mock_pet
-        ls["pet_timeout"] = 0.1
+        # _run_with_pet uses lock_timeout = pet_timeout * 0.8 for the lock
+        # acquire and pet_timeout for the outer wait_for.  The lock acquire
+        # must time out (-> lock_contended) *before* wait_for fires (-> timeout),
+        # so the margin between them must comfortably exceed CI thread-scheduling
+        # jitter.  1.0s gives a 0.2s margin; the old 0.1s left only 0.02s and
+        # flaked on loaded CI (reported as "timeout" instead of "lock_contended").
+        ls["pet_timeout"] = 1.0
         monkeypatch.setattr(_server, "_ensure_pet", lambda lstate: mock_pet)
 
         # Hold the pet lock from another thread so the worker times out
-        # acquiring it.
+        # acquiring it.  The hog holds until released in the finally below;
+        # the generous wait caps are just safety nets against a hung test.
         import threading
 
         held = threading.Event()
@@ -469,17 +476,17 @@ class TestRecentErrors:
         def _hog():
             with _server._pet_lock:
                 held.set()
-                release.wait(timeout=1.0)
+                release.wait(timeout=10.0)
 
         t = threading.Thread(target=_hog, daemon=True)
         t.start()
-        held.wait(timeout=1.0)
+        assert held.wait(timeout=10.0), "hog thread failed to acquire the lock"
 
         try:
             result = await _run_with_pet(lambda pet: None, ls, "LockedOp")
         finally:
             release.set()
-            t.join(timeout=1.0)
+            t.join(timeout=10.0)
 
         assert result["reason"] == "lock_contended"
         assert any(

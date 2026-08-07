@@ -15,3 +15,5 @@ build/
 .venv/
 rebase.log
 cp.log
+launch.sh
+bin/

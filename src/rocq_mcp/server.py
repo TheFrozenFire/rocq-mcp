@@ -295,10 +295,24 @@ def _is_safe_arg(value: str) -> bool:
 
 
 def _check_path_containment(ws: Path, dir_arg: str) -> str | None:
-    """Resolve dir_arg relative to ws and return it if within ws, else None."""
+    """Resolve dir_arg relative to ws and return it if usable, else None.
+
+    Accepts a ``-R``/``-Q``/``-I`` directory that is within ws, and ALSO a
+    relative path that *escapes* ws (e.g. ``../../rocq-proofs``) when it
+    resolves to an existing directory — the standard sibling-library layout
+    (a project next to the library repo it depends on).  coq-lsp / pet already
+    honour such a load path from the ``_CoqProject``, so the out-of-band coqc
+    used for ``file_diagnostics`` must honour it too; rejecting it made coqc
+    report a spurious ``Cannot find a physical path bound to logical path X``
+    for every cross-repo file even though the interactive session loaded fine.
+    Absolute paths remain rejected (a ``_CoqProject`` steering coqc at an
+    arbitrary absolute location is the shape still guarded against)."""
     if os.path.isabs(dir_arg):
         return None
-    if _path_within((ws / dir_arg).resolve(), ws.resolve()):
+    resolved = (ws / dir_arg).resolve()
+    if _path_within(resolved, ws.resolve()):
+        return dir_arg
+    if resolved.is_dir():
         return dir_arg
     return None
 

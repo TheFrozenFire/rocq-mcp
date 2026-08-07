@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import PET_AVAILABLE
+from tests.conftest import COQC_AVAILABLE, PET_AVAILABLE
 
 pytestmark = pytest.mark.skipif(not PET_AVAILABLE, reason="pet not available")
 
@@ -279,3 +279,40 @@ class TestSilentImportFailureSurfaced:
             f"useless empty outline. Expected either the actual content "
             f"or a compile_diagnostic field. Got: {result!r}"
         )
+
+
+@pytest.mark.skipif(not COQC_AVAILABLE, reason="coqc not available")
+def test_file_diagnostics_anchors_at_project_root_for_subdir_workspace(tmp_path):
+    """Regression: ``file_diagnostics`` must walk UP to the project root's
+    ``_CoqProject`` (as coq-lsp / pet do) before running the out-of-band coqc.
+
+    The bug: when the effective workspace is a SUBDIR without its own project
+    marker (e.g. ``theory/`` under a repo whose ``_CoqProject`` lives one level
+    up, or a repo that maps a sibling library via ``-R ../../lib Name``),
+    ``_parse_project_flags`` synthesised a bogus ``["-Q", <subdir>, "Test"]``
+    with no library mapping.  The diagnostics coqc then mis-reported every
+    cross-namespace ``Require Import`` as ``Cannot find a physical path bound to
+    logical path X`` — a false positive on a file that compiles cleanly.
+    """
+    import subprocess
+
+    from rocq_mcp.interactive import _coqc_file_diagnostics
+
+    root = tmp_path / "proj"
+    (root / "sub").mkdir(parents=True)
+    # Root maps '.' -> Proj; a dependency module lives at the root.
+    (root / "_CoqProject").write_text("-R . Proj\n")
+    (root / "Dep.v").write_text("Definition d := 0.\n")
+    subprocess.run(
+        ["coqc", "-R", str(root), "Proj", "-native-compiler", "no", str(root / "Dep.v")],
+        cwd=str(root),
+        check=True,
+    )
+    # A subdir file (sub/ has NO marker of its own) that Requires the
+    # root-namespaced dependency — resolvable only via the root's _CoqProject.
+    user = root / "sub" / "User.v"
+    user.write_text("Require Import Proj.Dep.\nDefinition u := d.\n")
+
+    # Workspace deliberately points at the marker-less subdir (the buggy input).
+    diag = _coqc_file_diagnostics(str(user), str(root / "sub"))
+    assert diag is None, f"expected no false diagnostic, got: {diag!r}"

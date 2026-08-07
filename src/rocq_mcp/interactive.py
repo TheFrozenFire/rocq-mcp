@@ -91,8 +91,19 @@ def _coqc_file_diagnostics(
         from rocq_mcp.compile import _run_coqc_file as _coqc_file
     except Exception:
         return None
+    # Resolve to the project root before the out-of-band coqc runs.  coq-lsp/pet
+    # walk UP from the file to find the nearest _CoqProject / _RocqProject, so the
+    # interactive session resolves cross-repo load paths (e.g. -R ../../rocq-proofs
+    # RocqProofs) even when the effective workspace is a SUBDIR without its own
+    # marker (e.g. theory/).  _parse_project_flags does NOT walk up: given such a
+    # subdir it synthesises a bogus ["-Q", <subdir>, "Test"] with no library
+    # mapping, so the diagnostics coqc mis-reports every cross-repo Require as
+    # "Cannot find a physical path bound to logical path X" — a false positive on a
+    # file that compiles fine.  Anchoring at the project root makes the out-of-band
+    # coqc read the same _CoqProject pet does.
+    root = _server._find_project_root_from_file(resolved_file) or workspace
     try:
-        result = _coqc_file(resolved_file, workspace, timeout)
+        result = _coqc_file(resolved_file, root, timeout)
     except Exception:
         return None
     if result.get("returncode", 0) == 0:
